@@ -1,0 +1,6 @@
+nfl-big-data-bowl-2026-prediction/**
+*.h5
+*.joblib
+*.npz
+*.png
+*.csv
