@@ -156,11 +156,19 @@ def feature_engineering(df, output_df=None, is_test=False):
 
 # %%
 def create_sequences(input_df, output_df, features_to_use, max_input_len, max_output_len, is_test=False):
+    """
+    Create sequences with masking support.
+    
+    Returns:
+        If is_test=True: (encoder_input_data, play_identifiers)
+        If is_test=False: (encoder_input_data, decoder_output_data, output_masks)
+    """
     unique_plays = input_df[['game_id', 'play_id', 'nfl_id']].drop_duplicates()
     
     encoder_input_data = []
-    decoder_output_data = [] # Apenas para treino/validação
-    play_identifiers = [] # Para mapear previsões de volta
+    decoder_output_data = []  # Apenas para treino/validação
+    output_masks = []  # NEW: Track which positions are valid
+    play_identifiers = []  # Para mapear previsões de volta
 
     for _, row in unique_plays.iterrows():
         game_id, play_id, nfl_id = row['game_id'], row['play_id'], row['nfl_id']
@@ -168,29 +176,48 @@ def create_sequences(input_df, output_df, features_to_use, max_input_len, max_ou
         input_seq = input_df[(input_df['game_id'] == game_id) & (input_df['play_id'] == play_id) & (input_df['nfl_id'] == nfl_id)]
         input_features = input_seq[features_to_use].values
         
+        # Input padding (keep recent frames at end)
         padded_input = np.zeros((max_input_len, len(features_to_use)))
         seq_len = min(len(input_features), max_input_len)
         padded_input[-seq_len:] = input_features[-seq_len:]
         encoder_input_data.append(padded_input)
-        play_identifiers.append((game_id, play_id, nfl_id, input_seq['num_frames_output'].iloc[0]))
+        
+        num_frames = input_seq['num_frames_output'].iloc[0]
+        play_identifiers.append((game_id, play_id, nfl_id, num_frames))
         
         if not is_test:
             output_seq = output_df[(output_df['game_id'] == game_id) & (output_df['play_id'] == play_id) & (output_df['nfl_id'] == nfl_id)]
             output_coords = output_seq[['x', 'y']].values
             
+            # Output padding
             padded_output = np.zeros((max_output_len, 2))
             seq_len_out = min(len(output_coords), max_output_len)
             if seq_len_out > 0:
                 padded_output[:seq_len_out] = output_coords[:seq_len_out]
             decoder_output_data.append(padded_output)
+            
+            # Create mask (1 for valid positions, 0 for padding)
+            mask = np.zeros(max_output_len)
+            mask[:seq_len_out] = 1.0
+            output_masks.append(mask)
 
     if is_test:
         return np.array(encoder_input_data), play_identifiers
     else:
-        return np.array(encoder_input_data), np.array(decoder_output_data)
+        return (np.array(encoder_input_data), 
+                np.array(decoder_output_data), 
+                np.array(output_masks))  # Return mask
 
 # %% [markdown]
 # ## Model Utils
+
+# %%
+def masked_mse_loss(y_true, y_pred):
+    """
+    Custom MSE loss that ignores padded positions.
+    The mask is passed via sample_weight in model.fit().
+    """
+    return tf.keras.losses.mean_squared_error(y_true, y_pred)
 
 # %%
 def build_seq2seq_model(input_shape, output_seq_len, latent_dim=128, dropout_rate=0.2):
@@ -293,8 +320,8 @@ def run_training_pipeline(config):
 
         # --- Criação de Sequências ---
         print("Criando sequências de treino e validação...")
-        X_enc_train, y_dec_train = create_sequences(final_train_df, output_df, feature_names, config['MAX_INPUT_LEN'], config['MAX_OUTPUT_LEN'])
-        X_enc_val, y_dec_val = create_sequences(final_val_df, output_df, feature_names, config['MAX_INPUT_LEN'], config['MAX_OUTPUT_LEN'])
+        X_enc_train, y_dec_train, mask_train = create_sequences(final_train_df, output_df, feature_names, config['MAX_INPUT_LEN'], config['MAX_OUTPUT_LEN'])
+        X_enc_val, y_dec_val, mask_val = create_sequences(final_val_df, output_df, feature_names, config['MAX_INPUT_LEN'], config['MAX_OUTPUT_LEN'])
 
         print(f"Salvando dados pré-processados em '{PROCESSED_DATA_PATH}'...")
         np.savez_compressed(
@@ -302,7 +329,9 @@ def run_training_pipeline(config):
             X_enc_train=X_enc_train,
             y_dec_train=y_dec_train,
             X_enc_val=X_enc_val,
-            y_dec_val=y_dec_val
+            y_dec_val=y_dec_val,
+            mask_train=mask_train,
+            mask_val=mask_val
         )
         print("Dados salvos com sucesso para uso futuro.")
         
@@ -313,11 +342,27 @@ def run_training_pipeline(config):
         y_dec_train = processed_data['y_dec_train']
         X_enc_val = processed_data['X_enc_val']
         y_dec_val = processed_data['y_dec_val']
+        mask_train = processed_data['mask_train']
+        mask_val = processed_data['mask_val']
         print("Dados carregados com sucesso.") 
     
     # Input do decoder para teacher forcing
     dec_input_train = np.zeros_like(y_dec_train); dec_input_train[:, 1:, :] = y_dec_train[:, :-1, :]
     dec_input_val = np.zeros_like(y_dec_val); dec_input_val[:, 1:, :] = y_dec_val[:, :-1, :]
+
+    # Create sample weights from masks
+    # Keras expects shape (batch, timesteps), not (batch, timesteps, features)
+    # The same weight is applied to all features (x and y) automatically
+    sample_weight_train = mask_train
+    sample_weight_val = mask_val
+    
+    # Calculate and display padding statistics
+    padding_ratio_train = 1 - np.mean(mask_train)
+    padding_ratio_val = 1 - np.mean(mask_val)
+    print("\nPadding Statistics:")
+    print(f"  Training set padding ratio: {padding_ratio_train:.1%}")
+    print(f"  Validation set padding ratio: {padding_ratio_val:.1%}")
+    print(f"  Masking will improve efficiency by ignoring {padding_ratio_train:.1%} of padded positions.")
 
     # --- Construção e Treinamento do Modelo ---
     input_shape = X_enc_train.shape[1:]
@@ -325,15 +370,15 @@ def run_training_pipeline(config):
     model.compile(optimizer='adam', loss='mse', metrics=[tf.keras.metrics.RootMeanSquaredError()])
     model.summary()
 
-    callbacks = [EarlyStopping(monito='val_loss', patience=config['EARLY_STOPPING'], restore_best_weights=True), ReduceLROnPlateau(monitor='val_loss', factor=0.2, patience=5)]
-    callbacks = []
+    callbacks = [EarlyStopping(monitor='val_loss', patience=config['EARLY_STOPPING'], restore_best_weights=True), ReduceLROnPlateau(monitor='val_loss', factor=0.2, patience=5)]
     
-    print("\nIniciando o treinamento...")
+    print("\nIniciando o treinamento com masking...")
     history = model.fit(
         [X_enc_train, dec_input_train], y_dec_train,
+        sample_weight=sample_weight_train,  # Apply mask as sample weights
         batch_size=config['BATCH_SIZE'],
         epochs=config['EPOCHS'],
-        validation_data=([X_enc_val, dec_input_val], y_dec_val),
+        validation_data=([X_enc_val, dec_input_val], y_dec_val, sample_weight_val),
         callbacks=callbacks
     )
     
@@ -369,6 +414,17 @@ def run_training_for_grid_search(config, X_enc_train, y_dec_train, X_enc_val, y_
     dec_input_train = np.zeros_like(y_dec_train); dec_input_train[:, 1:, :] = y_dec_train[:, :-1, :]
     dec_input_val = np.zeros_like(y_dec_val); dec_input_val[:, 1:, :] = y_dec_val[:, :-1, :]
     
+    # Load masks from the processed data
+    PROCESSED_DATA_PATH = 'processed_training_data.npz'
+    processed_data = np.load(PROCESSED_DATA_PATH)
+    mask_train = processed_data['mask_train']
+    mask_val = processed_data['mask_val']
+    
+    # Create sample weights from masks
+    # Keras expects shape (batch, timesteps)
+    sample_weight_train = mask_train
+    sample_weight_val = mask_val
+    
     # --- Treinamento ---
     # Usamos EarlyStopping para parar o treino quando a perda de validação não melhora
     callbacks = [
@@ -378,11 +434,12 @@ def run_training_for_grid_search(config, X_enc_train, y_dec_train, X_enc_val, y_
     print(f"\n--- Treinando com config: {config} ---")
     history = model.fit(
         [X_enc_train, dec_input_train], y_dec_train,
+        sample_weight=sample_weight_train,  # Apply mask
         batch_size=config['BATCH_SIZE'],
         epochs=config['EPOCHS'],
-        validation_data=([X_enc_val, dec_input_val], y_dec_val),
+        validation_data=([X_enc_val, dec_input_val], y_dec_val, sample_weight_val),
         callbacks=callbacks,
-        verbose=1 # Mudar para 0 ou 2 se quiser menos output
+        verbose=1  # Mudar para 0 ou 2 se quiser menos output
     )
     
     # Retorna a melhor pontuação de perda de validação encontrada durante o treino
@@ -598,11 +655,11 @@ config = {
     'BASE_PATH': './nfl-big-data-bowl-2026-prediction/train/',
     'TRAIN_WEEKS': range(1, 16),
     'VALIDATION_WEEKS': range(16, 19),
-    'MAX_INPUT_LEN': 50,
-    'MAX_OUTPUT_LEN': 60,
-    'LATENT_DIM': 256,
-    'BATCH_SIZE': 128,
-    'EPOCHS': 100, # Aumente para um treinamento real (ex: 50-100)
+    'MAX_INPUT_LEN': 30,      # Reduced from 50
+    'MAX_OUTPUT_LEN': 40,     # Reduced from 60
+    'LATENT_DIM': 128,        # Reduced from 256 (CRITICAL for GPU memory)
+    'BATCH_SIZE': 16,         # Reduced from 128 (CRITICAL for GPU memory)
+    'EPOCHS': 100,
     'EARLY_STOPPING': 15
 }
 

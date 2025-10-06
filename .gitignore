@@ -4,3 +4,6 @@ nfl-big-data-bowl-2026-prediction/**
 *.npz
 *.png
 *.csv
+.venv
+*.keras
+.python-version
